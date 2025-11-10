@@ -2,154 +2,209 @@
 """
 Streamlit app that:
  - sends a user prompt to an LLM to generate text
- - asks an image-generation endpoint to create an image from a prompt
- - displays results (text + generated image)
-Requirements:
-  pip install streamlit openai pillow requests
+ - asks an image-generation endpoint to create 1..N images from a prompt
+ - displays results (text + generated image(s))
+Requirements: see requirements.txt
 Environment:
   export OPENAI_API_KEY="sk-..."
-Notes:
- - This example uses the openai package (classic pattern). Your provider may have a different API.
- - Do NOT hardcode your API key.
+Or set in Streamlit secrets: {"OPENAI_API_KEY": "sk-..."}
 """
 
 import os
 import io
 import base64
-from typing import Optional
+from typing import Optional, List
 
 import streamlit as st
 from PIL import Image
 import requests
 import openai
 
-# ---------- Configuration ----------
-openai.api_key = os.environ.get("OPENAI_API_KEY")
+# ---------- Configuration & helpers ----------
+def get_api_key() -> Optional[str]:
+    # priority: streamlit secrets -> env var
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    return api_key
 
-# Optional: choose model names you prefer
-LLM_MODEL = "gpt-4o"            # replace with your preferred chat model
-IMAGE_SIZE = "1024x1024"       # "256x256", "512x512", "1024x1024"
-IMAGE_MODEL = "gpt-image-1"    # replace with your provider's image model name if needed
+OPENAI_API_KEY = get_api_key()
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
-# ---------- Helper functions ----------
-def call_llm_system(prompt: str, system_prompt: Optional[str] = None) -> str:
-    """
-    Call a chat/completion LLM and return the assistant reply as text.
-    This uses the OpenAI ChatCompletion API shape; adapt if your SDK differs.
-    """
+DEFAULT_LLM_MODEL = "gpt-4o"
+DEFAULT_IMAGE_MODEL = "gpt-image-1"
+DEFAULT_IMAGE_SIZE = "1024x1024"
+
+def call_llm_system(prompt: str, system_prompt: Optional[str], model: str) -> str:
     if not openai.api_key:
-        raise RuntimeError("OPENAI_API_KEY not set in environment.")
+        raise RuntimeError("OPENAI_API_KEY not set. Set environment variable or Streamlit secrets.")
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    # Synchronous call; change to async if you prefer
     resp = openai.ChatCompletion.create(
-        model=LLM_MODEL,
+        model=model,
         messages=messages,
         max_tokens=512,
         temperature=0.8,
         n=1,
     )
-    # defensive: extract text carefully
+
+    # Defensive extraction
     try:
         return resp["choices"][0]["message"]["content"].strip()
     except Exception:
+        # fallback to string representation
         return str(resp)
 
-def generate_image_from_prompt(prompt: str, size: str = IMAGE_SIZE) -> bytes:
+def generate_images(prompt: str, model: str, size: str, n: int) -> List[bytes]:
     """
-    Generate an image from a prompt. Returns raw bytes of the image (PNG/JPEG).
-    This assumes OpenAI-style images API which may return a base64 string or a url.
-    Adapt if your provider returns different payloads.
+    Returns list of image bytes (PNG/JPEG) generated from the prompt.
     """
     if not openai.api_key:
-        raise RuntimeError("OPENAI_API_KEY not set in environment.")
+        raise RuntimeError("OPENAI_API_KEY not set. Set environment variable or Streamlit secrets.")
 
-    # Try the 'images' endpoint: some SDKs use openai.Image.create
+    # Some providers support n>1 directly. We'll request n and ask for b64_json for reliability.
     try:
         resp = openai.Image.create(
-            model=IMAGE_MODEL,
+            model=model,
             prompt=prompt,
             size=size,
-            n=1,
-            response_format="b64_json"  # ask for base64 so we get bytes reliably
+            n=n,
+            response_format="b64_json"
         )
-        b64 = resp["data"][0]["b64_json"]
-        image_bytes = base64.b64decode(b64)
-        return image_bytes
+
+        images_bytes = []
+        for item in resp.get("data", []):
+            b64 = item.get("b64_json")
+            if b64:
+                images_bytes.append(base64.b64decode(b64))
+            else:
+                # fallback if response has a url
+                url = item.get("url")
+                if url:
+                    r = requests.get(url)
+                    r.raise_for_status()
+                    images_bytes.append(r.content)
+        return images_bytes
+
     except Exception as e:
-        # Fallback: if API returns a URL, fetch it
+        # Try a fallback flow if the provider returned urls or a different shape
         try:
-            resp = openai.Image.create(model=IMAGE_MODEL, prompt=prompt, size=size, n=1)
-            url = resp["data"][0]["url"]
-            r = requests.get(url)
-            r.raise_for_status()
-            return r.content
-        except Exception as e2:
-            raise RuntimeError(f"Image generation failed: {e} / {e2}")
+            resp = openai.Image.create(model=model, prompt=prompt, size=size, n=n)
+            images_bytes = []
+            for item in resp.get("data", []):
+                url = item.get("url")
+                if url:
+                    r = requests.get(url)
+                    r.raise_for_status()
+                    images_bytes.append(r.content)
+            if images_bytes:
+                return images_bytes
+        except Exception:
+            pass
+        raise RuntimeError(f"Image generation failed: {e}")
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="LLM + Image Generator", layout="centered")
+st.set_page_config(page_title="LLM + Image Generator", layout="wide")
 
 st.title("LLM + Image Generator (Streamlit)")
+st.markdown("Generate text with an LLM and create images from a prompt. Configure models & API key in the sidebar.")
 
 with st.sidebar:
-    st.header("Settings")
-    llm_model = st.text_input("LLM model", value=LLM_MODEL)
-    image_model = st.text_input("Image model", value=IMAGE_MODEL)
+    st.header("Configuration")
+    llm_model = st.text_input("LLM model", value=DEFAULT_LLM_MODEL)
+    image_model = st.text_input("Image model", value=DEFAULT_IMAGE_MODEL)
     image_size = st.selectbox("Image size", ["256x256", "512x512", "1024x1024"], index=2)
-    enable_system_prompt = st.checkbox("Use system prompt (for LLM)", value=True)
-    if enable_system_prompt:
-        system_prompt = st.text_area("System prompt (instructions for the LLM)",
-                                     value="You are a helpful assistant that writes concise creative captions and descriptions.")
+    max_images = st.slider("Number of image variations", min_value=1, max_value=6, value=2)
+    use_system_prompt = st.checkbox("Use system prompt for LLM", value=True)
+    if use_system_prompt:
+        system_prompt = st.text_area("System prompt (instructions for LLM)",
+                                     value="You are a helpful assistant that writes concise creative captions and descriptions.",
+                                     height=120)
     else:
         system_prompt = None
 
-st.subheader("User prompts")
-user_prompt = st.text_area("Describe what you want the LLM to produce (text).", height=120,
-                           value="Write a short, vivid product description for a cozy smart lamp called 'Lumi' targeted at urban professionals.")
-image_prompt = st.text_area("Describe the image you want generated.", height=140,
-                            value="A warm, modern smart lamp named 'Lumi' on a wooden bedside table, soft golden light, minimalist apartment interior, photographic style.")
+    st.markdown("---")
+    st.markdown("**API key**")
+    st.markdown("Set `OPENAI_API_KEY` in environment or place it in Streamlit secrets under `OPENAI_API_KEY`.")
+    if OPENAI_API_KEY:
+        st.success("API key detected (from env or secrets).")
+    else:
+        st.warning("No API key found. Set in environment or Streamlit secrets before using.")
 
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    if st.button("Generate Text (LLM)"):
-        try:
-            with st.spinner("Calling LLM..."):
-                # Update globals if user changed in sidebar
-                resp_text = call_llm_system(user_prompt, system_prompt)
-            st.success("Text generated")
-            st.markdown("**LLM output:**")
-            st.write(resp_text)
-        except Exception as exc:
-            st.error(f"LLM call failed: {exc}")
-
-with col2:
-    if st.button("Generate Image"):
-        try:
-            with st.spinner("Generating image..."):
-                image_bytes = generate_image_from_prompt(image_prompt, size=image_size)
-            st.success("Image generated")
-            # Display bytes as image
-            img = Image.open(io.BytesIO(image_bytes))
-            st.image(img, caption="Generated image", use_column_width=True)
-
-            # Offer download button
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            byte_im = buf.getvalue()
-            st.download_button("Download PNG", data=byte_im, file_name="generated.png", mime="image/png")
-        except Exception as exc:
-            st.error(f"Image generation failed: {exc}")
+st.subheader("Prompts")
+col_a, col_b = st.columns(2)
+with col_a:
+    user_prompt = st.text_area("LLM prompt (what you want the LLM to write)", height=180,
+                               value="Write a short, vivid product description for a cozy smart lamp called 'Lumi' targeted at urban professionals.")
+    generate_text_btn = st.button("Generate Text (LLM)")
+with col_b:
+    image_prompt = st.text_area("Image prompt (describe the image you want)", height=180,
+                                value="A warm, modern smart lamp named 'Lumi' on a wooden bedside table, soft golden light, minimalist apartment interior, photographic style.")
+    n_images = st.number_input("Number of images to generate", min_value=1, max_value=6, value=max_images)
+    generate_image_btn = st.button("Generate Image(s)")
 
 st.divider()
-st.markdown("### Tips")
+
+# LLM generation
+if generate_text_btn:
+    try:
+        with st.spinner("Calling LLM..."):
+            llm_output = call_llm_system(user_prompt, system_prompt, llm_model)
+        st.markdown("### LLM output")
+        st.write(llm_output)
+        # Offer download
+        st.download_button("Download text as .txt", data=llm_output, file_name="llm_output.txt", mime="text/plain")
+    except Exception as exc:
+        st.error(f"LLM call failed: {exc}")
+
+# Image generation
+if generate_image_btn:
+    try:
+        with st.spinner("Generating image(s)..."):
+            images = generate_images(image_prompt, image_model, image_size, int(n_images))
+        if not images:
+            st.error("No images were returned by the image API.")
+        else:
+            st.markdown(f"### Generated {len(images)} image(s)")
+            # Display in columns
+            cols = st.columns(len(images))
+            for i, img_bytes in enumerate(images):
+                try:
+                    img = Image.open(io.BytesIO(img_bytes))
+                except Exception:
+                    # try to force into PIL via requests fallback
+                    img = None
+                with cols[i]:
+                    if img:
+                        st.image(img, caption=f"Image #{i+1}", use_column_width=True)
+                        # prepare download bytes as PNG
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        st.download_button(f"Download Image #{i+1} (PNG)", data=buf.getvalue(),
+                                           file_name=f"generated_{i+1}.png", mime="image/png")
+                    else:
+                        # If PIL couldn't open, offer raw bytes download
+                        st.write("Couldn't render image preview, but you can download raw bytes.")
+                        st.download_button(f"Download raw Image #{i+1}", data=img_bytes,
+                                           file_name=f"generated_{i+1}.bin", mime="application/octet-stream")
+
+    except Exception as exc:
+        st.error(f"Image generation failed: {exc}")
+
+st.markdown("---")
+st.markdown("**Tips**")
 st.write(
-    "- Use a clear, descriptive prompt for images (subject, environment, style, mood, camera settings if you want photorealism).\n"
-    "- Keep your system prompt focused and short for best LLM results.\n"
-    "- If your provider returns URLs rather than base64 image data, the fallback fetch will attempt to download it."
+    "- For photorealistic images mention camera style / lens and lighting. For illustrations mention the art style.\n"
+    "- If your provider limits the number of images per request, reduce the 'Number of images' value.\n"
+    "- Keep your system prompt short and focused for best LLM results.\n"
 )
+
